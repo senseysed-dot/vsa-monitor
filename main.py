@@ -5,7 +5,7 @@ import logging
 import pandas as pd
 import requests
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from fugle_marketdata import RestClient
 
 # ================= 配置區 (GitHub Secrets) =================
@@ -35,7 +35,7 @@ RAW_LIST = [
     # 151-200: 重電、能源、航運、鋼鐵、水泥
     '1519', '1503', '1513', '1514', '1504', '1510', '1605', '1608', '1609', '1501', 
     '6806', '6443', '6477', '3708', '6244', '2207', '2201', '2497', '2231', '1536', 
-    '1522', '1319', '东阳', '3552', '6279', '2603', '2609', '2615', '2618', '2610', 
+    '1522', '1319', '3552', '6279', '2603', '2609', '2615', '2618', '2610', 
     '2606', '2605', '2637', '2002', '2014', '2031', '2006', '2015', '1101', '1102', 
     '2542', '2548', '5534', '1301', '1303', '6505', '1326', '1304', '1308', '2030',
     # 201-250: 金融、生技、零售、餐飲
@@ -70,11 +70,18 @@ except Exception as e:
     logger.error(f"富果客戶端初始化失敗: {e}")
     sys.exit(1)
 
-def get_stock_name(symbol):
-    try:
-        res = stock.snapshot.quotes(symbol=symbol)
-        return res.get('data', [{}])[0].get('name', '')
-    except: return ''
+def build_name_cache():
+    """從快照 API 一次性載入所有股票名稱，建立緩存字典"""
+    cache = {}
+    for market in ['TSE', 'OTC']:
+        try:
+            res = stock.snapshot.quotes(market=market)
+            for item in res.get('data', []):
+                if 'symbol' in item:
+                    cache[item['symbol']] = item.get('name', item['symbol'])
+        except Exception as e:
+            logger.warning(f"無法取得 {market} 市場名稱: {e}")
+    return cache
 
 def send_tg_message(message):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -86,23 +93,31 @@ def send_tg_message(message):
 
 def calculate_vsa_strategy(symbol):
     try:
-        data = stock.historical.candles(symbol=symbol, timeframe='D')
-        if not data or 'data' not in data or not data['data']: return None
-        
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
+        data = stock.historical.candles(**{'symbol': symbol, 'timeframe': 'D', 'from': from_date, 'to': to_date})
+        if not data or 'data' not in data or not data['data']:
+            return None
+
         df = pd.DataFrame(data['data'])
-        if len(df) < 22: return None
-        
-        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+        df = df.sort_values('date').reset_index(drop=True)
+
+        if len(df) < 22:
+            return None
+
         current = df.iloc[-1]
         lookback = df.iloc[-21:-1]
-        
-        max_vol_idx = lookback['volume'].idxmax()
-        max_vol_row = lookback.loc[max_vol_idx]
-        
-        loc_idx = df.index.get_loc(max_vol_idx)
-        if loc_idx == 0: return None
-        prev_vol = df.iloc[loc_idx - 1]['volume']
-        
+
+        max_vol_pos = len(df) - 21 + int(lookback['volume'].values.argmax())
+        max_vol_row = df.iloc[max_vol_pos]
+
+        if max_vol_pos == 0:
+            return None
+        prev_vol = df.iloc[max_vol_pos - 1]['volume']
+
         # VSA 核心判定：倍量陰線 (陰線且量 >= 前日2倍)
         if max_vol_row['close'] < max_vol_row['open'] and max_vol_row['volume'] >= (prev_vol * 2):
             resistance = max_vol_row['high']
@@ -115,7 +130,8 @@ def calculate_vsa_strategy(symbol):
                     'stop': max_vol_row['low'],
                     'ratio': round(current['volume'] / max_vol_row['volume'], 2)
                 }
-    except: pass
+    except Exception as e:
+        logger.debug(f"[{symbol}] VSA 計算異常: {e}")
     return None
 
 def main():
@@ -128,11 +144,15 @@ def main():
     logger.info(f"📊 VSA 掃描任務啟動 | 標的數：{len(MONITOR_LIST)}")
     
     hits = 0
+    logger.info("正在載入股票名稱緩存...")
+    name_cache = build_name_cache()
+    logger.info(f"名稱緩存建立完成，共 {len(name_cache)} 筆")
+
     for i, symbol in enumerate(MONITOR_LIST):
         sig = calculate_vsa_strategy(symbol)
         if sig:
             hits += 1
-            name = get_stock_name(symbol)
+            name = name_cache.get(symbol, symbol)
             msg = (
                 f"🎯 **VSA 突破：{sig['symbol']} {name}**\n"
                 f"📊 目前市價：`{sig['price']}`\n"
@@ -144,9 +164,8 @@ def main():
                 f"📉 突破量比：`{sig['ratio']}`"
             )
             send_tg_message(msg)
-            
-        if i % 15 == 0:
-            time.sleep(0.4)
+
+        time.sleep(0.3)
             
     duration = (datetime.now() - start_time).total_seconds()
     
