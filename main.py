@@ -57,14 +57,14 @@ MONITOR_LIST = sorted(list(set([s for s in RAW_LIST if s.isdigit() and len(s) ==
 # ==========================================
 
 # ================= VSA 策略參數 =================
-SUPPLY_CANDLE_VOL_MULTIPLIER = 2.0   # 供給帶最低量比（相對 20 日均量）
-MIN_BEARISH_BODY_DROP = 0.02         # 供給帶黑 K 最低跌幅（2%）
-MIN_DAILY_GAIN = 0.025               # 今日突破最低漲幅（2.5%）
-CLOSE_POSITION_MIN = 0.5             # 收盤需位於當日振幅的上半部（>= 50%）
-SUPPLY_LOOKBACK_DAYS = 30            # 供給帶查找窗口（近 30 個交易日，遠供給意義較低）
-MIN_TODAY_VOL_RATIO = 1.2            # 今日成交量需 >= 20 日均量的 1.2 倍（確認需求放量）
-MAX_MA60_EXTENSION = 1.25            # 股價不得超過 MA60 的 125%（避免追高過度延伸）
-MAX_STOP_PCT = 0.10                  # 止損距離不得超過現價的 10%（控制風險）
+SUPPLY_CANDLE_VOL_MULTIPLIER = 1.5   # 供給帶最低量比（相對 20 日均量）
+MIN_BEARISH_BODY_DROP = 0.01         # 供給帶黑 K 最低跌幅（1%）
+MIN_DAILY_GAIN = 0.015               # 今日突破最低漲幅（1.5%）
+CLOSE_POSITION_MIN = 0.4             # 收盤需位於當日振幅的上半部（>= 40%）
+SUPPLY_LOOKBACK_DAYS = 100           # 供給帶查找窗口（近 100 個交易日）
+MIN_TODAY_VOL_RATIO = 1.0            # 今日成交量需 >= 20 日均量的 1.0 倍（確認需求放量）
+MAX_MA60_EXTENSION = 1.5             # 股價不得超過 MA60 的 150%（避免追高過度延伸）
+MAX_STOP_PCT = 0.15                  # 止損距離不得超過現價的 15%（控制風險）
 # ================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
