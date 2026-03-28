@@ -56,6 +56,13 @@ RAW_LIST = [
 MONITOR_LIST = sorted(list(set([s for s in RAW_LIST if s.isdigit() and len(s) == 4])))[:300]
 # ==========================================
 
+# ================= VSA 策略參數 =================
+SUPPLY_CANDLE_VOL_MULTIPLIER = 2.0   # 供給帶最低量比（相對 20 日均量）
+MIN_BEARISH_BODY_DROP = 0.02         # 供給帶黑 K 最低跌幅（2%）
+MIN_DAILY_GAIN = 0.025               # 今日突破最低漲幅（2.5%）
+CLOSE_POSITION_MIN = 0.5             # 收盤需位於當日振幅的上半部（>= 50%）
+# ================================================
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -128,12 +135,12 @@ def calculate_vsa_strategy(symbol):
         if prev['close'] <= 0:
             return None
         today_gain = (current['close'] - prev['close']) / prev['close']
-        if today_gain <= 0.025:
+        if today_gain <= MIN_DAILY_GAIN:
             return None
 
         # 收盤需在當日實體上半部（防長上影線假突破）
         day_range = current['high'] - current['low']
-        if day_range > 0 and (current['close'] - current['low']) / day_range < 0.5:
+        if day_range > 0 and (current['close'] - current['low']) / day_range < CLOSE_POSITION_MIN:
             return None
 
         # 以近 20 日平均量作為基準，比單日前日量更穩定
@@ -164,7 +171,7 @@ def calculate_vsa_strategy(symbol):
                 continue
             body_drop = (row['open'] - row['close']) / row['open']
 
-            if is_bearish and vol_ratio >= 2.0 and body_drop > 0.02:
+            if is_bearish and vol_ratio >= SUPPLY_CANDLE_VOL_MULTIPLIER and body_drop > MIN_BEARISH_BODY_DROP:
                 resistance = row['high']
                 # 突破偵測：今日收盤站上壓力帶
                 if current['close'] > resistance and vol_ratio > best_vol_ratio:
