@@ -56,6 +56,17 @@ RAW_LIST = [
 MONITOR_LIST = sorted(list(set([s for s in RAW_LIST if s.isdigit() and len(s) == 4])))[:300]
 # ==========================================
 
+# ================= VSA 策略參數 =================
+SUPPLY_CANDLE_VOL_MULTIPLIER = 2.0   # 供給帶最低量比（相對 20 日均量）
+MIN_BEARISH_BODY_DROP = 0.02         # 供給帶黑 K 最低跌幅（2%）
+MIN_DAILY_GAIN = 0.025               # 今日突破最低漲幅（2.5%）
+CLOSE_POSITION_MIN = 0.5             # 收盤需位於當日振幅的上半部（>= 50%）
+SUPPLY_LOOKBACK_DAYS = 30            # 供給帶查找窗口（近 30 個交易日，遠供給意義較低）
+MIN_TODAY_VOL_RATIO = 1.2            # 今日成交量需 >= 20 日均量的 1.2 倍（確認需求放量）
+MAX_MA60_EXTENSION = 1.25            # 股價不得超過 MA60 的 125%（避免追高過度延伸）
+MAX_STOP_PCT = 0.10                  # 止損距離不得超過現價的 10%（控制風險）
+# ================================================
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -85,7 +96,7 @@ def build_name_cache():
 
 def send_tg_message(message):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
@@ -105,18 +116,56 @@ def calculate_vsa_strategy(symbol):
         df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('date').reset_index(drop=True)
 
-        if len(df) < 30:
+        # 需要足夠的資料計算 MA60
+        if len(df) < 65:
             return None
 
         current = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        # 以近 20 日平均量作為基準，比單日前日量更穩定
+        # === 1. 趨勢過濾器：收盤 > MA60 且 MA60 向上 ===
+        ma60 = df['close'].rolling(60).mean()
+        ma60_now = ma60.iloc[-1]
+        ma60_prev5 = ma60.iloc[-6]  # 5 個交易日前
+        if pd.isna(ma60_now) or pd.isna(ma60_prev5):
+            return None
+        if current['close'] <= ma60_now:
+            return None
+        if ma60_now <= ma60_prev5:  # MA60 未向上
+            return None
+
+        # === 2. 今日攻擊性確認 ===
+        # 今日必須是陽線（收盤 > 開盤）
+        if current['close'] <= current['open']:
+            return None
+
+        # 漲幅必須 > 2.5%
+        if prev['close'] <= 0:
+            return None
+        today_gain = (current['close'] - prev['close']) / prev['close']
+        if today_gain <= MIN_DAILY_GAIN:
+            return None
+
+        # 收盤需在當日實體上半部（防長上影線假突破）
+        day_range = current['high'] - current['low']
+        if day_range > 0 and (current['close'] - current['low']) / day_range < CLOSE_POSITION_MIN:
+            return None
+
+        # 以近 20 日平均量作為基準
         avg_vol_20 = df['volume'].iloc[-21:-1].mean()
         if avg_vol_20 <= 0:
             return None
 
-        # 往回最多 60 個交易日尋找供給帶（放寬查找窗口）
-        lookback_start = max(1, len(df) - 61)
+        # 今日成交量需放量（>= 1.2 倍均量），確認需求真實
+        if current['volume'] < avg_vol_20 * MIN_TODAY_VOL_RATIO:
+            return None
+
+        # 過度延伸保護：股價不得超過 MA60 的 125%，避免追高
+        if current['close'] > ma60_now * MAX_MA60_EXTENSION:
+            return None
+
+        # 往回最多 30 個交易日尋找供給帶（近期供給才具參考價值）
+        lookback_start = max(1, len(df) - SUPPLY_LOOKBACK_DAYS - 1)
         best_signal = None
         best_vol_ratio = 0.0
 
@@ -126,25 +175,36 @@ def calculate_vsa_strategy(symbol):
                 continue
             row = df.iloc[i]
 
-            # 計算該日的局部 20 日均量作為相對基準（固定 20 根，比較標準一致）
+            # 計算該日的局部 20 日均量作為相對基準
             local_avg_vol = df['volume'].iloc[i - 20:i].mean()
             if local_avg_vol <= 0:
                 continue
             vol_ratio = row['volume'] / local_avg_vol
 
-            # VSA 核心：高量陰線（供給/壓力帶），門檻從前日2倍放寬至均量1.5倍
+            # === 3. 真・供給帶：爆量陰線（成交量 >= 2 倍均量 且跌幅 > 2%）===
             is_bearish = row['close'] < row['open']
-            if is_bearish and vol_ratio >= 1.5:
+            if row['open'] <= 0:
+                continue
+            body_drop = (row['open'] - row['close']) / row['open']
+
+            if is_bearish and vol_ratio >= SUPPLY_CANDLE_VOL_MULTIPLIER and body_drop > MIN_BEARISH_BODY_DROP:
                 resistance = row['high']
-                # 突破偵測：今日收盤站上壓力帶（不再限制今日量需小於供給日）
+                # 突破偵測：今日收盤站上壓力帶
                 if current['close'] > resistance and vol_ratio > best_vol_ratio:
+                    # 止損距離保護：止損不得超過現價的 10%
+                    stop_pct = (current['close'] - row['low']) / current['close']
+                    if stop_pct > MAX_STOP_PCT:
+                        continue
                     best_vol_ratio = vol_ratio
                     best_signal = {
                         'symbol': symbol,
                         'price': current['close'],
                         'resistance': resistance,
                         'stop': row['low'],
+                        'supply_date': row['date'],
+                        'today_vol_ratio': round(current['volume'] / avg_vol_20, 2),
                         'ratio': round(current['volume'] / row['volume'], 2),
+                        'gain': round(today_gain * 100, 2),
                     }
 
         return best_signal
@@ -158,7 +218,7 @@ def main():
     now_tw = datetime.now(tw_tz).strftime('%Y-%m-%d %H:%M:%S')
 
     # 1. 發送啟動通知
-    send_tg_message(f"🚀 **VSA 監控啟動**\n⏰ 時間：`{now_tw}`\n📊 標的數：`{len(MONITOR_LIST)}` 檔\n🔍 狀態：正在掃描中...")
+    send_tg_message(f"🚀 <b>VSA 監控啟動</b>\n⏰ 時間：{now_tw}\n📊 標的數：{len(MONITOR_LIST)} 檔\n🔍 狀態：正在掃描中...")
     logger.info(f"📊 VSA 掃描任務啟動 | 標的數：{len(MONITOR_LIST)}")
     
     hits = 0
@@ -174,14 +234,15 @@ def main():
             # 避免股號重複：只在有真實股名（且不等於股號）時才附上股名
             name_part = f" {name}" if name and name != symbol else ''
             msg = (
-                f"🎯 **VSA 突破：{sig['symbol']}{name_part}**\n"
-                f"📊 目前市價：`{sig['price']}`\n"
-                f"🚧 壓力堡壘：`{sig['resistance']}`\n"
+                f"🎯 <b>VSA 突破</b> <code>{sig['symbol']}</code>{name_part}\n"
+                f"📊 目前市價：{sig['price']}\n"
+                f"📈 今日漲幅：{sig['gain']}%\n"
+                f"🚧 突破壓力：{sig['resistance']}（供給日：{sig['supply_date']}）\n"
                 f"------------------------\n"
-                f"💡 **建議策略**\n"
-                f"💰 進場：站穩 `{sig['resistance']}`\n"
-                f"🛑 止損：跌破 `{sig['stop']}`\n"
-                f"📉 突破量比：`{sig['ratio']}`"
+                f"💡 <b>建議策略</b>\n"
+                f"💰 進場：站穩 {sig['resistance']}\n"
+                f"🛑 止損：跌破 {sig['stop']}\n"
+                f"📦 今日量比：{sig['today_vol_ratio']}x（突破量比：{sig['ratio']}x）"
             )
             send_tg_message(msg)
 
@@ -190,7 +251,7 @@ def main():
     duration = (datetime.now() - start_time).total_seconds()
     
     # 2. 發送結束通知
-    send_tg_message(f"✅ **VSA 掃描完成**\n⏱ 耗時：`{duration:.1f}` 秒\n🎯 偵測訊號：`{hits}` 個")
+    send_tg_message(f"✅ <b>VSA 掃描完成</b>\n⏱ 耗時：{duration:.1f} 秒\n🎯 偵測訊號：{hits} 個")
     logger.info(f"✅ 掃描完成 | 耗時：{duration:.2f}s | 發現訊號：{hits}")
 
 if __name__ == "__main__":
