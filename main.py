@@ -94,7 +94,7 @@ def send_tg_message(message):
 def calculate_vsa_strategy(symbol):
     try:
         to_date = datetime.now().strftime('%Y-%m-%d')
-        from_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
         data = stock.historical.candles(**{'symbol': symbol, 'timeframe': 'D', 'from': from_date, 'to': to_date})
         if not data or 'data' not in data or not data['data']:
             return None
@@ -105,31 +105,49 @@ def calculate_vsa_strategy(symbol):
         df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('date').reset_index(drop=True)
 
-        if len(df) < 22:
+        if len(df) < 30:
             return None
 
         current = df.iloc[-1]
-        lookback = df.iloc[-21:-1]
 
-        max_vol_pos = len(df) - 21 + int(lookback['volume'].values.argmax())
-        max_vol_row = df.iloc[max_vol_pos]
-
-        if max_vol_pos == 0:
+        # 以近 20 日平均量作為基準，比單日前日量更穩定
+        avg_vol_20 = df['volume'].iloc[-21:-1].mean()
+        if avg_vol_20 <= 0:
             return None
-        prev_vol = df.iloc[max_vol_pos - 1]['volume']
 
-        # VSA 核心判定：倍量陰線 (陰線且量 >= 前日2倍)
-        if max_vol_row['close'] < max_vol_row['open'] and max_vol_row['volume'] >= (prev_vol * 2):
-            resistance = max_vol_row['high']
-            # 突破偵測：今日價 > 壓力位 且 今日量 < 歷史高量 (縮量過頂)
-            if current['close'] > resistance and current['volume'] < max_vol_row['volume']:
-                return {
-                    'symbol': symbol,
-                    'price': current['close'],
-                    'resistance': resistance,
-                    'stop': max_vol_row['low'],
-                    'ratio': round(current['volume'] / max_vol_row['volume'], 2)
-                }
+        # 往回最多 60 個交易日尋找供給帶（放寬查找窗口）
+        lookback_start = max(1, len(df) - 61)
+        best_signal = None
+        best_vol_ratio = 0.0
+
+        for i in range(lookback_start, len(df) - 1):
+            # 至少需要 20 日歷史量才能計算穩定均量
+            if i < 20:
+                continue
+            row = df.iloc[i]
+
+            # 計算該日的局部 20 日均量作為相對基準（固定 20 根，比較標準一致）
+            local_avg_vol = df['volume'].iloc[i - 20:i].mean()
+            if local_avg_vol <= 0:
+                continue
+            vol_ratio = row['volume'] / local_avg_vol
+
+            # VSA 核心：高量陰線（供給/壓力帶），門檻從前日2倍放寬至均量1.5倍
+            is_bearish = row['close'] < row['open']
+            if is_bearish and vol_ratio >= 1.5:
+                resistance = row['high']
+                # 突破偵測：今日收盤站上壓力帶（不再限制今日量需小於供給日）
+                if current['close'] > resistance and vol_ratio > best_vol_ratio:
+                    best_vol_ratio = vol_ratio
+                    best_signal = {
+                        'symbol': symbol,
+                        'price': current['close'],
+                        'resistance': resistance,
+                        'stop': row['low'],
+                        'ratio': round(current['volume'] / row['volume'], 2),
+                    }
+
+        return best_signal
     except Exception as e:
         logger.debug(f"[{symbol}] VSA 計算異常: {e}")
     return None
@@ -152,9 +170,11 @@ def main():
         sig = calculate_vsa_strategy(symbol)
         if sig:
             hits += 1
-            name = name_cache.get(symbol, symbol)
+            name = name_cache.get(symbol, '')
+            # 避免股號重複：只在有真實股名（且不等於股號）時才附上股名
+            name_part = f" {name}" if name and name != symbol else ''
             msg = (
-                f"🎯 **VSA 突破：{sig['symbol']} {name}**\n"
+                f"🎯 **VSA 突破：{sig['symbol']}{name_part}**\n"
                 f"📊 目前市價：`{sig['price']}`\n"
                 f"🚧 壓力堡壘：`{sig['resistance']}`\n"
                 f"------------------------\n"
