@@ -59,8 +59,8 @@ MONITOR_LIST = sorted(list(set([s for s in RAW_LIST if s.isdigit() and len(s) ==
 # ================= VSA 策略參數 =================
 SUPPLY_CANDLE_VOL_MULTIPLIER = 1.5   # 供給帶最低量比（相對 20 日均量）
 MIN_BEARISH_BODY_DROP = 0.01         # 供給帶黑 K 最低跌幅（1%）
-MIN_DAILY_GAIN = 0.015               # 今日突破最低漲幅（1.5%）
-CLOSE_POSITION_MIN = 0.4             # 收盤需位於當日振幅的上半部（>= 40%）
+MIN_DAILY_GAIN = 0.010               # 今日突破最低漲幅（1.0%）
+CLOSE_POSITION_MIN = 0.35            # 收盤需位於當日振幅的上半部（>= 35%）
 SUPPLY_LOOKBACK_DAYS = 100           # 供給帶查找窗口（近 100 個交易日）
 MIN_TODAY_VOL_RATIO = 1.0            # 今日成交量需 >= 20 日均量的 1.0 倍（確認需求放量）
 MAX_MA60_EXTENSION = 1.5             # 股價不得超過 MA60 的 150%（避免追高過度延伸）
@@ -81,18 +81,18 @@ except Exception as e:
     logger.error(f"富果客戶端初始化失敗: {e}")
     sys.exit(1)
 
-def build_name_cache():
-    """從快照 API 一次性載入所有股票名稱，建立緩存字典"""
-    cache = {}
-    for market in ['TSE', 'OTC']:
-        try:
-            res = stock.snapshot.quotes(market=market)
-            for item in res.get('data', []):
-                if 'symbol' in item:
-                    cache[item['symbol']] = item.get('name', item['symbol'])
-        except Exception as e:
-            logger.warning(f"無法取得 {market} 市場名稱: {e}")
-    return cache
+def get_stock_name(symbol):
+    """查詢單一股票名稱，若無法取得則回傳空字串"""
+    try:
+        res = stock.snapshot.quotes(symbol=symbol)
+        data = res.get('data', [])
+        if data and isinstance(data, list):
+            return data[0].get('name', '')
+        if isinstance(data, dict):
+            return data.get('name', '')
+    except Exception:
+        pass
+    return ''
 
 def send_tg_message(message):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -222,15 +222,12 @@ def main():
     logger.info(f"📊 VSA 掃描任務啟動 | 標的數：{len(MONITOR_LIST)}")
     
     hits = 0
-    logger.info("正在載入股票名稱緩存...")
-    name_cache = build_name_cache()
-    logger.info(f"名稱緩存建立完成，共 {len(name_cache)} 筆")
 
     for i, symbol in enumerate(MONITOR_LIST):
         sig = calculate_vsa_strategy(symbol)
         if sig:
             hits += 1
-            name = name_cache.get(symbol, '')
+            name = get_stock_name(sig['symbol'])
             # 避免股號重複：只在有真實股名（且不等於股號）時才附上股名
             name_part = f" {name}" if name and name != symbol else ''
             msg = (
